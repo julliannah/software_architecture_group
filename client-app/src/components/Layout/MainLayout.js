@@ -2,7 +2,6 @@ import { Content, Footer, Header, Sidebar } from 'components/Layout';
 import React from 'react';
 import {
   MdImportantDevices,
-  // MdCardGiftcard,
   MdLoyalty,
 } from 'react-icons/md';
 import NotificationSystem from 'react-notification-system';
@@ -31,7 +30,7 @@ class MainLayout extends React.Component {
 
       this.notificationSystem.addNotification({
         title: <MdImportantDevices />,
-        message: 'Welome to Reduction Admin!',
+        message: 'Welcome to Reduction Admin!',
         level: 'info',
       });
     }, 1500);

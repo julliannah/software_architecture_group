@@ -9,7 +9,7 @@ const Footer = () => {
     <Navbar>
       <Nav navbar>
         <NavItem>
-            © 2021 Reduction Template, source on <SourceLink>Github</SourceLink>
+            © 2018 Reduction Template, source on <SourceLink>Github</SourceLink>
             <br/> and redesigned by Group 1 within the course EEET2582
         </NavItem>
       </Nav>
