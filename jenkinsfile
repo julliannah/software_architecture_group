@@ -1,0 +1,310 @@
+import groovy.json.JsonBuilder
+
+pipeline {
+    agent any
+
+    stages {
+        stage('Initalize Variables') {
+            steps {
+                script {
+                    GIT_COMMIT_HASH = sh (script: "git log -n 1 --pretty=format:'%H'", returnStdout: true)
+                    DOCKER_HOST = "gcr.io/kms-athenka-2"
+                    YAMLS_PATH = "pipelines/yamls"
+                    NAMESPACE = env.GIT_BRANCH.split('/').last()
+                    BACKEND_URL = "backend.slsops.coe.athenka.com"
+                    FRONTEND_URL = "app.slsops.coe.athenka.com"
+                    KEYCLOAK_SERVER = "https://keycloak.slsops.coe.athenka.com/auth"
+                    if (NAMESPACE != "develop") {
+                        BACKEND_URL = NAMESPACE + "." + BACKEND_URL
+                        FRONTEND_URL = NAMESPACE + "." + FRONTEND_URL
+                    }
+                    // If first build, set previous successful commit to the oldest commit hash
+                    if (!env.GIT_PREVIOUS_SUCCESSFUL_COMMIT){
+                        echo "first build"
+                        GIT_PREVIOUS_SUCCESSFUL_COMMIT = sh(returnStdout: true, script: "git rev-list --max-parents=0 HEAD").trim()
+                    }
+                    updateFiles = sh(returnStdout: true, script: "git diff --name-only ${env.GIT_COMMIT} ${GIT_PREVIOUS_SUCCESSFUL_COMMIT}").trim()
+                    BACKEND_CHANGES = updateFiles.contains("crawl_pipeline/analysis") || updateFiles.contains("backend/") || updateFiles.contains("labelstudio/") || 
+                        updateFiles.contains("pipelines/trigger_pipeline_image") || updateFiles.contains("pipelines/components/inference/") || updateFiles.contains("serving/predictor")
+                    FRONTEND_CHANGES = updateFiles.contains("front-end/")
+                    PIPELINE_CHANGES = updateFiles.contains("pipelines/pipelines/") || updateFiles.contains("pipelines/components/ingest_dataset") || 
+                        updateFiles.contains("pipelines/components/packages") || updateFiles.contains("pipelines/components/evaluating") ||
+                        updateFiles.contains("pipelines/components/training") || updateFiles.contains("pipelines/components/exporting") || 
+                        updateFiles.contains("pipelines/components/transforming")
+                    INFERENCE_CHANGES = updateFiles.contains("pipelines/components/inference")
+                    SERVING_PREPROCESSOR_CHANGES = updateFiles.contains("serving/preprocessor")
+                    CRAWL_PIPELINE_TRANSFORMER_CHANGES = updateFiles.contains("crawl_pipeline/transformer")
+                    CRAWL_PIPELINE_PREPROCESSOR_CHANGES = updateFiles.contains("crawl_pipeline/preprocessor")
+                    CRAWL_PIPELINE_CRAWLER_CHANGES = updateFiles.contains("crawl_pipeline/crawler")
+                    CRAWL_PIPELINE_TRIGGER_CRONJOB_CHANGES = updateFiles.contains("crawl_pipeline/trigger_crawl_cronjob")
+
+                    if (BACKEND_CHANGES) {
+                        INFERENCE_IMAGES = [:]
+                        inferenceNames = sh (script: "ls pipelines/components/inference | cat", returnStdout: true).split("\n")
+                        for (name in inferenceNames) {
+                            if (name.contains("pipeline_")){
+                                name = name.split("pipeline_")[1]
+                                echo "update inference image of ${name}"
+                                INFERENCE_IMAGES.put(name, "${DOCKER_HOST}/slsops-kubeflow-inference-${name.toLowerCase().replaceAll('_','-')}:${GIT_COMMIT_HASH}")
+                            }
+                        }
+                        INFERENCE_IMAGES_JSON_STRING = new JsonBuilder(INFERENCE_IMAGES).toPrettyString().toLowerCase().replaceAll("[\n\\s]", "").replaceAll('_','-')
+                        echo "${INFERENCE_IMAGES_JSON_STRING}"
+                    }
+                    updateFilesArray = updateFiles.split("\n")
+                    Set pipelineNames = []
+
+
+                    // if dependency changes, rebuild all images and update all pipelines
+                    if (updateFiles.contains("pipelines/components/packages/") || updateFiles.contains("pipelines/components/ingest_dataset/") 
+                        || updateFiles.contains("pipelines/pipelines/")) {
+                       pipelineFiles = sh (script: "ls pipelines/pipelines/ | cat", returnStdout: true).split("\n")
+                       for (file in pipelineFiles) {
+                           if (file.contains("pipeline_")) {
+                                echo "file = ${file}"
+                                pipelineNames.add(
+                                   (file.split("\\.")[0]).split("pipeline_")[1]
+                                )
+                           }
+                       }
+                    } else { // only build updated components and update corresponding pipelines
+                        for (file in updateFilesArray) {
+                            if (file.contains("/pipeline_")) {
+                                pipelineNames.add(
+                                    (file.split("/")[3]).split("pipeline_")[1]
+                                )
+                            }
+                        }
+                    }
+                    echo "FRONTEND_CHANGES = ${FRONTEND_CHANGES}"
+                    echo "BACKEND_CHANGES = ${BACKEND_CHANGES}"
+                    echo "PIPELINE_CHANGES = ${PIPELINE_CHANGES}"
+                    echo "INFERENCE_CHANGES = ${INFERENCE_CHANGES}"
+                    echo "SERVING_PREPROCESSOR_CHANGES = ${SERVING_PREPROCESSOR_CHANGES}"
+                    echo "CRAWL_PIPELINE_TRANSFORMER_CHANGES = ${CRAWL_PIPELINE_TRANSFORMER_CHANGES}"
+                    echo "CRAWL_PIPELINE_PREPROCESSOR_CHANGES = ${CRAWL_PIPELINE_PREPROCESSOR_CHANGES}"
+                    echo "CRAWL_PIPELINE_CRAWLER_CHANGES = ${CRAWL_PIPELINE_CRAWLER_CHANGES}"
+                    echo "CRAWL_PIPELINE_TRIGGER_CRONJOB_CHANGES = ${CRAWL_PIPELINE_TRIGGER_CRONJOB_CHANGES}"
+                    PIPELINE_NAMES = pipelineNames
+                }
+            }
+        }
+        stage('Building Images') {
+            steps {
+                script {
+                    if (FRONTEND_CHANGES) {
+                        echo 'Building frontend...'
+                        sh "docker build --network host \
+                            --build-arg REACT_APP_KEYCLOAK_SERVER=${KEYCLOAK_SERVER} \
+                            --build-arg REACT_APP_BACKEND=https://${FRONTEND_URL}/api \
+                            --build-arg NAMESPACE=${NAMESPACE} \
+                            -t ${DOCKER_HOST}/slsops-frontend:${GIT_COMMIT_HASH} front-end/." 
+                    }
+                    if (BACKEND_CHANGES) {
+                        echo 'Building backend...'
+                        sh "docker build --network host -t ${DOCKER_HOST}/slsops-backend:${GIT_COMMIT_HASH} backend/."
+                        echo 'Building crawl pipeline analysis...'
+                        sh "docker build --network host -t ${DOCKER_HOST}/slsops-crawl-pipeline-analysis:${GIT_COMMIT_HASH} crawl_pipeline/analysis/."
+                        echo 'Building labeling importer...'
+                        sh "docker build --network host -t ${DOCKER_HOST}/slsops-label-studio-importer:${GIT_COMMIT_HASH} labelstudio/importer/."
+                        echo 'Building labeling exporter...'
+                        sh "docker build --network host -t ${DOCKER_HOST}/slsops-label-studio-exporter:${GIT_COMMIT_HASH} labelstudio/exporter/."
+                        echo 'Building pipeline trigger image ...'
+                        sh "docker build --network host -t ${DOCKER_HOST}/slsops-pipeline-trigger:${GIT_COMMIT_HASH} \
+                            -f pipelines/trigger_pipeline_image/Dockerfile pipelines/."
+                        sh "docker build --network host -t ${DOCKER_HOST}/slsops-serving-predictor:latest serving/predictor"
+                        INFERENCE_IMAGES.each{k, v ->
+                            sh "docker build --network host -t ${v} \
+                            -f pipelines/components/inference/pipeline_${k}/Dockerfile \
+                            pipelines/components/inference/pipeline_${k}/." 
+                        } 
+                    }
+                    if (PIPELINE_CHANGES) {
+                        sh "docker build --network host -t \
+                            ${DOCKER_HOST}/slsops-pipelines-component-ingesting:${GIT_COMMIT_HASH} \
+                            -f pipelines/components/ingesting/Dockerfile pipelines/components/."
+                        build_components(PIPELINE_NAMES, "transforming")
+                        build_components(PIPELINE_NAMES, "fine_tuning")
+                        build_components(PIPELINE_NAMES, "training")
+                        build_components(PIPELINE_NAMES, "evaluating")
+                        build_components(PIPELINE_NAMES, "exporting")
+                    }
+                    if (SERVING_PREPROCESSOR_CHANGES) {
+                        sh "docker build --network host -t ${DOCKER_HOST}/slsops-serving-preprocessor:${GIT_COMMIT_HASH} serving/preprocessor"
+                    }
+                    if (CRAWL_PIPELINE_TRANSFORMER_CHANGES) {
+                        sh "docker build --network host -t ${DOCKER_HOST}/slsops-crawl-pipeline-transformer:${GIT_COMMIT_HASH} crawl_pipeline/transformer" 
+                    }
+                    if (CRAWL_PIPELINE_PREPROCESSOR_CHANGES) {
+                        sh "docker build --network host -t ${DOCKER_HOST}/slsops-crawl-pipeline-preprocessor:${GIT_COMMIT_HASH} crawl_pipeline/preprocessor"                     
+                    }
+                    if (CRAWL_PIPELINE_CRAWLER_CHANGES) {
+                         sh "docker build --network host -t ${DOCKER_HOST}/slsops-crawl-pipeline-crawler:${GIT_COMMIT_HASH} crawl_pipeline/crawler"                     
+                    }
+                    if (CRAWL_PIPELINE_TRIGGER_CRONJOB_CHANGES) {
+                        sh "docker build --network host -t ${DOCKER_HOST}/slsops-crawl-pipeline-trigger-cronjob:${GIT_COMMIT_HASH} crawl_pipeline/trigger_crawl_cronjob"                     
+                    }
+                }
+            }
+        }
+
+        stage('Test') {
+            steps {
+                echo 'Testing..'
+                echo 'All test cases passed.'
+            }
+        }
+
+        stage('SonarQube analysis') {
+            steps {
+                echo 'SonarQube start analyzing code quality...'
+                sh "export SONAR_SCANNER_OPTS='-Xmx512m'"
+                sh 'sonar-scanner -X \
+                    -Dsonar.projectKey=slsops \
+                    -Dsonar.sources=. \
+                    -Dsonar.host.url=$SONAR_HOST \
+                    -Dsonar.login=$SONAR_LOGIN'
+                echo 'SonarQube analysis has completed.'
+            }
+        }
+        stage('Deploy') {
+            steps {
+                script {
+                    if (FRONTEND_CHANGES) {
+                        echo 'Uploading frontend image ...'
+                        sh "docker push ${DOCKER_HOST}/slsops-frontend:${GIT_COMMIT_HASH}"
+                        echo 'Deploying frontend...'
+                        sh "helm upgrade --install frontend kubernetes/frontend/. \
+                            -f kubernetes/frontend/values.yaml -n ${NAMESPACE} \
+                            --set image.tag=${GIT_COMMIT_HASH} \
+                            --set image.repository=${DOCKER_HOST}/slsops-frontend \
+                            --set ingress.hosts[0].host=${FRONTEND_URL} \
+                            --set ingress.tls[0].hosts[0]=${FRONTEND_URL} \
+                            --set ingress.tls[0].secretName=${FRONTEND_URL}-tls"                    
+                    }
+                    if (BACKEND_CHANGES) {
+                        echo 'Uploading images'
+                        sh "docker push ${DOCKER_HOST}/slsops-backend:${GIT_COMMIT_HASH}"
+                        sh "docker push ${DOCKER_HOST}/slsops-crawl-pipeline-analysis:${GIT_COMMIT_HASH}"
+                        sh "docker push ${DOCKER_HOST}/slsops-label-studio-importer:${GIT_COMMIT_HASH}"
+                        sh "docker push ${DOCKER_HOST}/slsops-label-studio-exporter:${GIT_COMMIT_HASH}"
+                        sh "docker push ${DOCKER_HOST}/slsops-pipeline-trigger:${GIT_COMMIT_HASH}"
+                        sh "docker push ${DOCKER_HOST}/slsops-serving-predictor:latest"
+                        INFERENCE_IMAGES.each{k, v ->                
+                            sh "docker push ${v}"
+                        }
+                        echo 'Update backend config map'
+                        sh "kubectl create configmap backend-config \
+                            --from-literal=CRAWL_PIPELINE_ANALYSIS_IMAGE=${DOCKER_HOST}/slsops-crawl-pipeline-analysis:${GIT_COMMIT_HASH} \
+                            --from-literal=LABEL_STUDIO_IMPORTER_IMAGE=${DOCKER_HOST}/slsops-label-studio-importer:${GIT_COMMIT_HASH} \
+                            --from-literal=LABEL_STUDIO_EXPORTER_IMAGE=${DOCKER_HOST}/slsops-label-studio-exporter:${GIT_COMMIT_HASH} \
+                            --from-literal=KUBEFLOW_PIPELINE_TRIGGER_IMAGE=${DOCKER_HOST}/slsops-pipeline-trigger:${GIT_COMMIT_HASH} \
+                            --from-literal=SERVING_PREDICTOR_IMAGE=${DOCKER_HOST}/slsops-serving-predictor:latest \
+                            --from-literal=KUBEFLOW_INFERENCE_IMAGES='${INFERENCE_IMAGES_JSON_STRING}' \
+                            --from-literal=NAMESPACE=${NAMESPACE} \
+                            --dry-run=client -o yaml | kubectl apply -f - -n ${NAMESPACE}"
+
+                        echo 'Deploying backend...'
+                        sh "helm upgrade --install backend kubernetes/backend/. \
+                            -f kubernetes/backend/values.yaml -n ${NAMESPACE} \
+                            --set image.tag=${GIT_COMMIT_HASH} \
+                            --set image.repository=${DOCKER_HOST}/slsops-backend \
+                            --set ingress.hosts[0].host=${BACKEND_URL} \
+                            --set ingress.tls[0].hosts[0]=${BACKEND_URL} \
+                            --set ingress.tls[0].secretName=${BACKEND_URL}-tls"
+                        sh "kubectl delete pods -n ${NAMESPACE} -l app=serving-predictor" 
+                    }
+                    if (PIPELINE_CHANGES) {
+                        echo "Uploading Kubeflow component images"
+                        sh "docker push ${DOCKER_HOST}/slsops-pipelines-component-ingesting:${GIT_COMMIT_HASH}"
+                        upload_components(PIPELINE_NAMES, "transforming")
+                        upload_components(PIPELINE_NAMES, "fine_tuning")
+                        upload_components(PIPELINE_NAMES, "training")
+                        upload_components(PIPELINE_NAMES, "evaluating")
+                        upload_components(PIPELINE_NAMES, "exporting")
+                        echo "Update Kubeflow pipelines"
+                        sh "echo 'TAG='${GIT_COMMIT_HASH} > pipelines/pipelines/.env"
+                        sh "echo 'YAMLS_PATH='${YAMLS_PATH} >> pipelines/pipelines/.env"
+                        upload_pipelines(PIPELINE_NAMES)
+                    }
+                    if (INFERENCE_CHANGES) {
+                        updatedFileNames = sh (script: "ls pipelines/components/inference | cat", returnStdout: true).split("\n")
+                        CONFIG_MAP_ARGUMENTS = ""
+                        for (name in updatedFileNames) {
+                            if (name.contains("pipeline_")){
+                                name = name.split("pipeline_")[1]
+                                echo "update inference of ${name}"
+                                CONFIG_MAP_ARGUMENTS += "--from-file=${name.toLowerCase().replaceAll('_','-')}-model.py=pipelines/components/inference/pipeline_${name}/MyModel.py "
+                            }
+                        }
+                        sh "kubectl create configmap model-class \
+                            ${CONFIG_MAP_ARGUMENTS} \
+                            --dry-run=client -o yaml | kubectl apply -f - -n ${NAMESPACE}"
+                    }
+                    if (SERVING_PREPROCESSOR_CHANGES) {
+                        sh "docker push ${DOCKER_HOST}/slsops-serving-preprocessor:${GIT_COMMIT_HASH}"
+                        sh "helm upgrade --install serving-preprocessor kubernetes/kafka-streams/serving/preprocessor/. \
+                            -f kubernetes/kafka-streams/serving/preprocessor/values.yaml -n ${NAMESPACE} \
+                            --set image.tag=${GIT_COMMIT_HASH} \
+                            --set image.repository=${DOCKER_HOST}/slsops-serving-preprocessor"
+                    }
+                    if (CRAWL_PIPELINE_PREPROCESSOR_CHANGES) {
+                        sh "docker push ${DOCKER_HOST}/slsops-crawl-pipeline-preprocessor:${GIT_COMMIT_HASH}"
+                        sh "helm upgrade --install crawl-pipeline-preprocessor kubernetes/kafka-streams/crawl_pipeline/preprocessor/. \
+                            -f kubernetes/kafka-streams/crawl_pipeline/preprocessor/values.yaml -n ${NAMESPACE} \
+                            --set image.tag=${GIT_COMMIT_HASH} \
+                            --set image.repository=${DOCKER_HOST}/slsops-crawl-pipeline-preprocessor"
+                    }
+                    if (CRAWL_PIPELINE_CRAWLER_CHANGES) {
+                        sh "docker push ${DOCKER_HOST}/slsops-crawl-pipeline-crawler:${GIT_COMMIT_HASH}"
+                        sh "helm upgrade --install crawl-pipeline-crawler kubernetes/kafka-streams/crawl_pipeline/crawler/. \
+                            -f kubernetes/kafka-streams/crawl_pipeline/crawler/values.yaml -n ${NAMESPACE} \
+                            --set image.tag=${GIT_COMMIT_HASH} \
+                            --set image.repository=${DOCKER_HOST}/slsops-crawl-pipeline-crawler"
+                    }
+                    if (CRAWL_PIPELINE_TRIGGER_CRONJOB_CHANGES) {
+                        sh "docker push ${DOCKER_HOST}/slsops-crawl-pipeline-trigger-cronjob:${GIT_COMMIT_HASH}"
+                        sh "helm upgrade --install crawl-pipeline-trigger-cronjob kubernetes/kafka-streams/crawl_pipeline/trigger_cronjob/. \
+                            -f kubernetes/kafka-streams/crawl_pipeline/trigger_cronjob/values.yaml -n ${NAMESPACE} \
+                            --set image.tag=${GIT_COMMIT_HASH} \
+                            --set image.repository=${DOCKER_HOST}/slsops-crawl-pipeline-trigger-cronjob"
+                    }
+                    if (CRAWL_PIPELINE_TRANSFORMER_CHANGES) {
+                        sh "docker push ${DOCKER_HOST}/slsops-crawl-pipeline-transformer:${GIT_COMMIT_HASH}"
+                        sh "helm upgrade --install crawl-pipeline-transformer kubernetes/kafka-streams/crawl_pipeline/transformer/. \
+                            -f kubernetes/kafka-streams/crawl_pipeline/transformer/values.yaml -n ${NAMESPACE} \
+                            --set image.tag=${GIT_COMMIT_HASH} \
+                            --set image.repository=${DOCKER_HOST}/slsops-crawl-pipeline-transformer"
+                    }
+                }
+            }
+        }
+    }
+}
+
+def build_components(names, type) {
+    names.each { name ->
+        // verify if this pipeline has this component
+        component_exists = sh (script: "[ -d 'pipelines/components/${type}/pipeline_${name}' ]", returnStatus: true)
+        if (component_exists == 0) {
+            sh "docker build --network host -t \
+            ${DOCKER_HOST}/slsops-pipelines-component-${type.replaceAll('_','-')}-${name.toLowerCase().replaceAll('_','-')}:${GIT_COMMIT_HASH} \
+            -f pipelines/components/${type}/pipeline_${name}/Dockerfile pipelines/components/."
+        } 
+    }
+}
+
+def upload_components(names, type) {
+    names.each { name ->
+        component_exists = sh (script: "[ -d 'pipelines/components/${type}/pipeline_${name}' ]", returnStatus: true) 
+        if (component_exists == 0) { 
+            sh "docker push ${DOCKER_HOST}/slsops-pipelines-component-${type.replaceAll('_','-')}-${name.toLowerCase().replaceAll('_','-')}:${GIT_COMMIT_HASH}"
+        }
+    }
+}
+
+def upload_pipelines(names) {
+    names.each { name ->
+        sh "python3 pipelines/pipelines/pipeline_${name}.py"
+    }
+}
